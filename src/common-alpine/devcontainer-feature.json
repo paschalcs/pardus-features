@@ -1,0 +1,17 @@
+{
+    "id": "common-alpine",
+    "version": "1.0.14",
+    "name": "alpine",
+    "documentationURL": "https://github.com/paschalcs/pardus-features/tree/main/src/common-alpine",
+    "description": "Alpine Linux package management",
+    "options": {
+        "version": {
+            "default": "latest",
+            "description": "Select the version to install.",
+            "proposals": [
+                "latest"
+            ],
+            "type": "string"
+        }
+    }
+}
