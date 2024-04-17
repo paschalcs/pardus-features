@@ -7,7 +7,7 @@
 # Docs: https://github.com/microsoft/vscode-dev-containers/blob/main/script-library/docs/common.md
 # Maintainer: The VS Code and Codespaces Teams
 #
-# Syntax: ./common-alpine.sh [install zsh flag] [username] [user UID] [user GID] [install Oh My Zsh! flag]
+# Syntax: ./common-alpine.sh [install zsh flag] [username] [user UID] [user GID] [install Oh My Zsh! flag] [apk package] ...
 
 set -e
 
@@ -24,6 +24,7 @@ USERNAME=${2:-"automatic"}
 USER_UID=${3:-"automatic"}
 USER_GID=${4:-"automatic"}
 INSTALL_OH_MYS=${5:-"true"}
+APK_PACKAGES=${6:-}
 MARKER_FILE="/usr/local/etc/vscode-dev-containers/common"
 SCRIPT_DIR="$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)"
 
@@ -100,7 +101,8 @@ if [ "${PACKAGES_ALREADY_INSTALLED}" != "true" ]; then
         which \
         ncdu \
         shadow \
-        strace
+        strace \
+        "${APK_PACKAGES}"
 
     # Install man pages - package name varies between 3.12 and earlier versions
     if apk info man > /dev/null 2>&1; then
