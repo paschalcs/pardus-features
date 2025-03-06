@@ -18,7 +18,7 @@ POWERSHELL_PROFILE_URL="${POWERSHELLPROFILEURL}"
 
 MICROSOFT_GPG_KEYS_URI="https://packages.microsoft.com/keys/microsoft.asc"
 POWERSHELL_ARCHIVE_ARCHITECTURES="amd64"
-POWERSHELL_ARCHIVE_VERSION_CODENAMES="stretch buster bionic focal bullseye jammy"
+POWERSHELL_ARCHIVE_VERSION_CODENAMES="stretch buster bionic focal bullseye jammy bookworm noble"
 GPG_KEY_SERVERS="keyserver hkp://keyserver.ubuntu.com
 keyserver hkp://keyserver.ubuntu.com:80
 keyserver hkps://keys.openpgp.org
@@ -221,35 +221,52 @@ install_using_github() {
         echo "${powershell_archive_sha256} *${powershell_filename}" | sha256sum -c -
     fi
     tar xf "${powershell_filename}" -C "${powershell_target_path}"
-    ln -s "${powershell_target_path}/pwsh" /usr/local/bin/pwsh
+    chmod 755 "${powershell_target_path}/pwsh"
+    ln -sf "${powershell_target_path}/pwsh" /usr/bin/pwsh
+    add-shell "/usr/bin/pwsh"
+    cd /tmp
     rm -rf /tmp/pwsh
 }
 
-export DEBIAN_FRONTEND=noninteractive
+if ! type pwsh >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Source /etc/os-release to get OS info
+    . /etc/os-release
+    architecture="$(dpkg --print-architecture)"
 
-# Source /etc/os-release to get OS info
-. /etc/os-release
-architecture="$(dpkg --print-architecture)"
-
-if [[ "${POWERSHELL_ARCHIVE_ARCHITECTURES}" = *"${architecture}"* ]] && [[  "${POWERSHELL_ARCHIVE_VERSION_CODENAMES}" = *"${VERSION_CODENAME}"* ]]; then
-    install_using_apt || use_github="true"
+    if [[ "${POWERSHELL_ARCHIVE_ARCHITECTURES}" = *"${architecture}"* ]] && [[  "${POWERSHELL_ARCHIVE_VERSION_CODENAMES}" = *"${VERSION_CODENAME}"* ]]; then
+        install_using_apt || use_github="true"
+    else
+        use_github="true"
+    fi
+    
+    if [ "${use_github}" = "true" ]; then
+        echo "Attempting install from GitHub release..."
+        install_using_github
+    fi
 else
-    use_github="true"
+    echo "PowerShell is already installed."
 fi
 
-if [ "${use_github}" = "true" ]; then
-    echo "Attempting install from GitHub release..."
-    install_using_github
-fi
-
-# If PowerShell modules are requested, loop through and install 
+# If PowerShell modules are requested, loop through and install
 if [ ${#POWERSHELL_MODULES[@]} -gt 0 ]; then
     echo "Installing PowerShell Modules: ${POWERSHELL_MODULES}"
     modules=(`echo ${POWERSHELL_MODULES} | tr ',' ' '`)
     for i in "${modules[@]}"
     do
-        echo "Installing ${i}"
-        pwsh -Command "Install-Module -Name ${i} -AllowClobber -Force -Scope AllUsers" || continue
+        module_parts=(`echo ${i} | tr '==' ' '`)
+        module_name="${module_parts[0]}"  
+        args="-Name ${module_name} -AllowClobber -Force -Scope AllUsers"  
+        if [ "${#module_parts[@]}" -eq 2 ]; then
+            module_version="${module_parts[1]}"
+            echo "Installing ${module_name} v${module_version}"
+            args+=" -RequiredVersion ${module_version}"
+        else
+            echo "Installing latest version for ${i} module"
+        fi
+
+        pwsh -Command "Install-Module $args" || continue
     done
 fi
 

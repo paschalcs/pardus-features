@@ -15,10 +15,6 @@ GIT_LFS_ARCHIVE_GPG_KEY_URI="https://packagecloud.io/github/git-lfs/gpgkey"
 GIT_LFS_ARCHIVE_ARCHITECTURES="amd64 arm64"
 GIT_LFS_ARCHIVE_VERSION_CODENAMES="stretch buster bullseye bionic focal jammy"
 GIT_LFS_CHECKSUM_GPG_KEYS="0x88ace9b29196305ba9947552f1ba225c0223b187 0x86cd3297749375bcf8206715f54fe648088335a9 0xaa3b3450295830d2de6db90caba67be5a5795889"
-GPG_KEY_SERVERS="keyserver hkp://keyserver.ubuntu.com
-keyserver hkp://keyserver.ubuntu.com:80
-keyserver hkps://keys.openpgp.org
-keyserver hkp://keyserver.pgp.com"
 
 set -e
 
@@ -64,15 +60,56 @@ find_version_from_git_tags() {
     echo "${variable_name}=${!variable_name}"
 }
 
+# Get the list of GPG key servers that are reachable
+get_gpg_key_servers() {
+    local curl_args=""
+    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+
+    if [ ! -z "${KEYSERVER_PROXY}" ]; then
+        curl_args="--proxy ${KEYSERVER_PROXY}"
+    fi
+
+    test_keyserver() {
+        local keyserver="$1"
+        local keyserver_curl_url="$2"
+        if curl -s ${curl_args} --max-time 5 "${keyserver_curl_url}" > /dev/null; then
+            echo "keyserver ${keyserver}"
+            keyserver_reachable=true
+        else
+            echo "(*) Keyserver ${keyserver} is not reachable." >&2
+        fi
+    }
+
+    # Explicitly test these in order because Bash v4.4.20 (Ubuntu Bionic)
+    # enumerates associative array keys in a different order than Bash v5
+    test_keyserver "hkp://keyserver.ubuntu.com"    "http://keyserver.ubuntu.com:11371"
+    test_keyserver "hkp://keyserver.ubuntu.com:80" "http://keyserver.ubuntu.com"
+    test_keyserver "hkp://keyserver.pgp.com"       "http://keyserver.pgp.com:11371"
+    # Test this server last because keys.openpgp.org strips user IDs from keys unless
+    # the owner gives permission, which causes gpg in Ubuntu Bionic to reject the key
+    # (https://github.com/devcontainers/features/issues/1055)
+    test_keyserver "hkps://keys.openpgp.org"       "https://keys.openpgp.org"
+
+    if ! $keyserver_reachable; then
+        echo "(!) No keyserver is reachable." >&2
+        exit 1
+    fi
+}
+
 # Import the specified key in a variable name passed in as 
 receive_gpg_keys() {
     local keys=${!1}
+
+    # Install curl
+    if ! type curl > /dev/null 2>&1; then
+        check_packages curl
+    fi
 
     # Use a temporary location for gpg keys to avoid polluting image
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
-    echo -e "disable-ipv6\n${GPG_KEY_SERVERS}" > ${GNUPGHOME}/dirmngr.conf
+    echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
     # GPG key download sometimes fails for some reason and retrying fixes it.
     local retry_count=0
     local gpg_ok="false"
@@ -82,7 +119,7 @@ receive_gpg_keys() {
         echo "(*) Downloading GPG key..."
         ( echo "${keys}" | xargs -n 1 gpg --recv-keys) 2>&1 && gpg_ok="true"
         if [ "${gpg_ok}" != "true" ]; then
-            echo "(*) Failed getting key, retring in 10s..."
+            echo "(*) Failed getting key, retrying in 10s..."
             (( retry_count++ ))
             sleep 10s
         fi

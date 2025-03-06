@@ -31,12 +31,7 @@ ADDITIONAL_VERSIONS="${ADDITIONALVERSIONS:-""}"
 # Comma-separated list of additional tools to be installed via pipx.
 IFS="," read -r -a DEFAULT_UTILS <<< "${TOOLSTOINSTALL:-flake8,autopep8,black,yapf,mypy,pydocstyle,pycodestyle,bandit,pipenv,virtualenv,pytest}"
 
-
 PYTHON_SOURCE_GPG_KEYS="64E628F8D684696D B26995E310250568 2D347EA6AA65421D FB9921286F5E1540 3A5CA953F73C700D 04C367C218ADD4FF 0EDDC5F26A45C816 6AF053F07D9DC8D2 C9BE28DEE6DF025C 126EB563A74B06BF D9866941EA5BBD71 ED9D77D5 A821E680E5FA6305"
-GPG_KEY_SERVERS="keyserver hkp://keyserver.ubuntu.com
-keyserver hkp://keyserver.ubuntu.com:80
-keyserver hkps://keys.openpgp.org
-keyserver hkp://keyserver.pgp.com"
 
 KEYSERVER_PROXY="${HTTPPROXY:-"${HTTP_PROXY:-""}"}"
 
@@ -63,6 +58,14 @@ elif [[ "${ID}" = "rhel" || "${ID}" = "fedora" || "${ID}" = "mariner" || "${ID_L
 else
     echo "Linux distro ${ID} not supported."
     exit 1
+fi
+
+if [ "${ADJUSTED_ID}" = "rhel" ] && [ "${VERSION_CODENAME-}" = "centos7" ]; then
+    # As of 1 July 2024, mirrorlist.centos.org no longer exists.
+    # Update the repo files to reference vault.centos.org.
+    sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/*.repo
+    sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/*.repo
+    sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/*.repo
 fi
 
 # To find some devel packages, some rhel need to enable specific extra repos, but not on RedHat ubi images...
@@ -130,6 +133,38 @@ updaterc() {
     fi
 }
 
+# Get the list of GPG key servers that are reachable
+get_gpg_key_servers() {
+    declare -A keyservers_curl_map=(
+        ["hkp://keyserver.ubuntu.com"]="http://keyserver.ubuntu.com:11371"
+        ["hkp://keyserver.ubuntu.com:80"]="http://keyserver.ubuntu.com"
+        ["hkps://keys.openpgp.org"]="https://keys.openpgp.org"
+        ["hkp://keyserver.pgp.com"]="http://keyserver.pgp.com:11371"
+    )
+
+    local curl_args=""
+    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+
+    if [ ! -z "${KEYSERVER_PROXY}" ]; then
+        curl_args="--proxy ${KEYSERVER_PROXY}"
+    fi
+
+    for keyserver in "${!keyservers_curl_map[@]}"; do
+        local keyserver_curl_url="${keyservers_curl_map[${keyserver}]}"
+        if curl -s ${curl_args} --max-time 5 ${keyserver_curl_url} > /dev/null; then
+            echo "keyserver ${keyserver}"
+            keyserver_reachable=true
+        else
+            echo "(*) Keyserver ${keyserver} is not reachable." >&2
+        fi
+    done
+
+    if ! $keyserver_reachable; then
+        echo "(!) No keyserver is reachable." >&2
+        exit 1
+    fi
+}
+
 # Import the specified key in a variable name passed in as
 receive_gpg_keys() {
     local keys=${!1}
@@ -143,11 +178,16 @@ receive_gpg_keys() {
         keyring_args="${keyring_args} --keyserver-options http-proxy=${KEYSERVER_PROXY}"
     fi
 
+    # Install curl
+    if ! type curl > /dev/null 2>&1; then
+        check_packages curl
+    fi
+
     # Use a temporary location for gpg keys to avoid polluting image
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
-    echo -e "disable-ipv6\n${GPG_KEY_SERVERS}" > ${GNUPGHOME}/dirmngr.conf
+    echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
     # GPG key download sometimes fails for some reason and retrying fixes it.
     local retry_count=0
     local gpg_ok="false"
@@ -157,7 +197,7 @@ receive_gpg_keys() {
         echo "(*) Downloading GPG key..."
         ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys) 2>&1 && gpg_ok="true"
         if [ "${gpg_ok}" != "true" ]; then
-            echo "(*) Failed getting key, retring in 10s..."
+            echo "(*) Failed getting key, retrying in 10s..."
             (( retry_count++ ))
             sleep 10s
         fi
@@ -182,6 +222,11 @@ receive_gpg_keys_centos7() {
         keyring_args="${keyring_args} --keyserver-options http-proxy=${KEYSERVER_PROXY}"
     fi
 
+    # Install curl
+    if ! type curl > /dev/null 2>&1; then
+        check_packages curl
+    fi
+
     # Use a temporary location for gpg keys to avoid polluting image
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
@@ -193,7 +238,7 @@ receive_gpg_keys_centos7() {
     set +e
         echo "(*) Downloading GPG keys..."
         until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "5" ]; do
-            for keyserver in $(echo "${GPG_KEY_SERVERS}" | sed 's/keyserver //'); do
+            for keyserver in $(echo "$(get_gpg_key_servers)" | sed 's/keyserver //'); do
                 ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys --keyserver=${keyserver} ) 2>&1
                 downloaded_keys=$(gpg --list-keys | grep ^pub | wc -l)
                 if [[ ${num_keys} = ${downloaded_keys} ]]; then
@@ -202,7 +247,7 @@ receive_gpg_keys_centos7() {
                 fi
             done
             if [ "${gpg_ok}" != "true" ]; then
-                echo "(*) Failed getting key, retring in 10s..."
+                echo "(*) Failed getting key, retrying in 10s..."
                 (( retry_count++ ))
                 sleep 10s
             fi
@@ -420,16 +465,18 @@ install_prev_vers_cpython() {
 install_cpython() {
     VERSION=$1
     INSTALL_PATH="${PYTHON_INSTALL_PATH}/${VERSION}"
+
+    # Check if the specified Python version is already installed
     if [ -d "${INSTALL_PATH}" ]; then
         echo "(!) Python version ${VERSION} already exists."
-        exit 1
+    else
+        mkdir -p /tmp/python-src ${INSTALL_PATH}
+        cd /tmp/python-src
+        cpython_tgz_filename="Python-${VERSION}.tgz"
+        cpython_tgz_url="https://www.python.org/ftp/python/${VERSION}/${cpython_tgz_filename}"
+        echo "Downloading ${cpython_tgz_filename}..."
+        curl -sSL -o "/tmp/python-src/${cpython_tgz_filename}" "${cpython_tgz_url}"
     fi
-    mkdir -p /tmp/python-src ${INSTALL_PATH}
-    cd /tmp/python-src
-    cpython_tgz_filename="Python-${VERSION}.tgz"
-    cpython_tgz_url="https://www.python.org/ftp/python/${VERSION}/${cpython_tgz_filename}"
-    echo "Downloading ${cpython_tgz_filename}..."
-    curl -sSL -o "/tmp/python-src/${cpython_tgz_filename}" "${cpython_tgz_url}"
 }
 
 install_from_source() {
@@ -515,20 +562,20 @@ install_using_oryx() {
     VERSION=$1
     INSTALL_PATH="${PYTHON_INSTALL_PATH}/${VERSION}"
 
+    # Check if the specified Python version is already installed
     if [ -d "${INSTALL_PATH}" ]; then
         echo "(!) Python version ${VERSION} already exists."
-        exit 1
+    else
+        # The python install root path may not exist, so create it
+        mkdir -p "${PYTHON_INSTALL_PATH}"
+        oryx_install "python" "${VERSION}" "${INSTALL_PATH}" "lib" || return 1
+
+        ln -s "${INSTALL_PATH}/bin/idle3" "${INSTALL_PATH}/bin/idle"
+        ln -s "${INSTALL_PATH}/bin/pydoc3" "${INSTALL_PATH}/bin/pydoc"
+        ln -s "${INSTALL_PATH}/bin/python3-config" "${INSTALL_PATH}/bin/python-config"
+
+        add_symlink
     fi
-
-    # The python install root path may not exist, so create it
-    mkdir -p "${PYTHON_INSTALL_PATH}"
-    oryx_install "python" "${VERSION}" "${INSTALL_PATH}" "lib" || return 1
-
-    ln -s "${INSTALL_PATH}/bin/idle3" "${INSTALL_PATH}/bin/idle"
-    ln -s "${INSTALL_PATH}/bin/pydoc3" "${INSTALL_PATH}/bin/pydoc"
-    ln -s "${INSTALL_PATH}/bin/python3-config" "${INSTALL_PATH}/bin/python-config"
-
-    add_symlink
 }
 
 sudo_if() {
@@ -719,15 +766,19 @@ esac
 
 check_packages ${REQUIRED_PKGS}
 
+# Function to get the major version from a SemVer string
+get_major_version() {
+    local version="$1"
+    echo "$version" | cut -d '.' -f 1
+}
+
 # Install Python from source if needed
 if [ "${PYTHON_VERSION}" != "none" ]; then
     if ! cat /etc/group | grep -e "^python:" > /dev/null 2>&1; then
         groupadd -r python
     fi
     usermod -a -G python "${USERNAME}"
-
     CURRENT_PATH="${PYTHON_INSTALL_PATH}/current"
-
     install_python ${PYTHON_VERSION}
 
     # Additional python versions to be installed but not be set as default.
@@ -736,9 +787,27 @@ if [ "${PYTHON_VERSION}" != "none" ]; then
         OLDIFS=$IFS
         IFS=","
             read -a additional_versions <<< "$ADDITIONAL_VERSIONS"
-            for version in "${additional_versions[@]}"; do
+            major_version=$(get_major_version ${VERSION})
+            if type apt-get > /dev/null 2>&1; then
+                # Debian/Ubuntu: Use update-alternatives
+                update-alternatives --install ${CURRENT_PATH} python${major_version} ${PYTHON_INSTALL_PATH}/${VERSION} $((${#additional_versions[@]}+1))
+                update-alternatives --set python${major_version} ${PYTHON_INSTALL_PATH}/${VERSION}
+            elif type dnf > /dev/null 2>&1 || type yum > /dev/null 2>&1 || type microdnf > /dev/null 2>&1; then
+                # Fedora/RHEL/CentOS: Use alternatives
+                alternatives --install ${CURRENT_PATH} python${major_version} ${PYTHON_INSTALL_PATH}/${VERSION} $((${#additional_versions[@]}+1))
+                alternatives --set python${major_version} ${PYTHON_INSTALL_PATH}/${VERSION}
+            fi
+            for i in "${!additional_versions[@]}"; do
+                version=${additional_versions[$i]}
                 OVERRIDE_DEFAULT_VERSION="false"
                 install_python $version
+                if type apt-get > /dev/null 2>&1; then
+                    # Debian/Ubuntu: Use update-alternatives
+                    update-alternatives --install ${CURRENT_PATH} python${major_version} ${PYTHON_INSTALL_PATH}/${VERSION} $((${i}+1))
+                elif type dnf > /dev/null 2>&1 || type yum > /dev/null 2>&1 || type microdnf > /dev/null 2>&1; then
+                    # Fedora/RHEL/CentOS: Use alternatives
+                    alternatives --install ${CURRENT_PATH} python${major_version} ${PYTHON_INSTALL_PATH}/${VERSION} $((${i}+1))
+                fi
             done
         INSTALL_PATH="${OLD_INSTALL_PATH}"
         IFS=$OLDIFS
@@ -865,21 +934,15 @@ if [ "${INSTALL_JUPYTERLAB}" = "true" ]; then
     install_user_package $INSTALL_UNDER_ROOT jupyterlab
     install_user_package $INSTALL_UNDER_ROOT jupyterlab-git
 
+    # Create a symlink to the JupyterLab binary for non root users
     if [ "$INSTALL_UNDER_ROOT" = false ]; then
-        # JupyterLab would have installed into /home/${USERNAME}/.local/bin
-        # Adding it to default path for Codespaces which use non-login shells
-        SUDOERS_FILE="/etc/sudoers.d/$USERNAME"
-        SEARCH_STR="Defaults secure_path="
-        REPLACE_STR="Defaults secure_path=/home/${USERNAME}/.local/bin"
-
-        if grep -qs ${SEARCH_STR} ${SUDOERS_FILE}; then
-            # string found and file is present
-            sed -i "s|${SEARCH_STR}|${REPLACE_STR}:|g" "${SUDOERS_FILE}"
-        else
-            # either string is not found, or file is not present
-            # In either case take same action, note >> places at end of file
-            echo "${REPLACE_STR}:${PATH}" >> ${SUDOERS_FILE}
+        JUPYTER_INPATH=/home/${USERNAME}/.local/bin
+        if [ ! -d "$JUPYTER_INPATH" ]; then
+            echo "Error: $JUPYTER_INPATH does not exist."
+            exit 1
         fi
+        JUPYTER_PATH=/usr/local/jupyter
+        ln -s "$JUPYTER_INPATH" "$JUPYTER_PATH"
     fi
 
     # Configure JupyterLab if needed
